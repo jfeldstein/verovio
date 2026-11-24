@@ -364,6 +364,8 @@ private:
     void ReadMusicXmlFigures(pugi::xml_node, Measure *measure);
     void ReadMusicXmlForward(pugi::xml_node, Measure *measure, const std::string &measureNum);
     void ReadMusicXmlHarmony(pugi::xml_node, Measure *measure);
+    void ReadMusicXmlMultiRestMeasure(pugi::xml_node, Measure *measure, const short int staffOffset, bool isLast);
+    void ReadMusicXmlMultiRestNote(pugi::xml_node, Measure *measure, const short int staffOffset);
     void ReadMusicXmlNote(pugi::xml_node, Measure *measure, const short int staffOffset, Section *section);
     void ReadMusicXmlPrint(pugi::xml_node, Section *section);
     void ReadMusicXmlSound(pugi::xml_node, Measure *measure, Section *section);

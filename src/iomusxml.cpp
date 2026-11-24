@@ -1854,20 +1854,16 @@ bool MusicXmlInput::ReadMusicXmlPart(pugi::xml_node node, Section *section, shor
             this->AddMeasure(section, measure, i);
         }
         else {
-            // Handle barline parsing for the multirests (where barline would be defined in last measure of the mRest)
-            // If this is last measure, find starting measure of the mRest (based on the Id) and add barline to it
-            auto lastElementIter = std::find_if(m_multiRests.begin(), m_multiRests.end(),
-                [i](const std::pair<int, int> &elem) { return i == elem.second; });
-            if (lastElementIter != m_multiRests.end()) {
+            // Read the measures after the first one of a multirest into its measure (the barline is the one of the
+            // last)
+            auto spanIter = std::find_if(m_multiRests.begin(), m_multiRests.end(),
+                [i](const std::pair<int, int> &elem) { return (elem.first < i) && (i <= elem.second); });
+            if (spanIter != m_multiRests.end()) {
                 auto measureIter = std::find_if(m_measureCounts.begin(), m_measureCounts.end(),
-                    [lastElementIter](
-                        const std::pair<Measure *, int> &elem) { return lastElementIter->first == elem.second; });
+                    [spanIter](const std::pair<Measure *, int> &elem) { return spanIter->first == elem.second; });
                 if (measureIter != m_measureCounts.end()) {
-                    for (auto it = xmlMeasure.node().begin(); it != xmlMeasure.node().end(); ++it) {
-                        if (IsElement(*it, "barline")) {
-                            this->ReadMusicXmlBarLine(*it, measureIter->first);
-                        }
-                    }
+                    this->ReadMusicXmlMultiRestMeasure(
+                        xmlMeasure.node(), measureIter->first, staffOffset, (i == spanIter->second));
                 }
             }
         }
@@ -2005,8 +2001,8 @@ bool MusicXmlInput::ReadMusicXmlMeasure(
         }
         else if (IsElement(child, "note")) {
             if (isMultiRest) {
-                // the notes are not read, but their durations advance the measure time
-                if (!child.child("chord")) m_durTotal += child.child("duration").text().as_int();
+                // the notes are not read, but their fermatas, caesuras and breath marks are, and their durations count
+                this->ReadMusicXmlMultiRestNote(child, measure, staffOffset);
             }
             else {
                 this->ReadMusicXmlNote(child, measure, staffOffset, section);
@@ -2940,6 +2936,97 @@ void MusicXmlInput::ReadMusicXmlHarmony(pugi::xml_node node, Measure *measure)
     harm->SetTstamp((double)(m_durTotal + durOffset) * (double)m_meterUnit / (double)(4 * m_ppq) + 1.0);
     m_controlElements.push_back({ m_measureCounts.at(measure), harm });
     m_harmStack.push_back(harm);
+}
+
+void MusicXmlInput::ReadMusicXmlMultiRestNote(pugi::xml_node node, Measure *measure, const short int staffOffset)
+{
+    assert(node);
+    assert(measure);
+
+    const int duration = node.child("duration").text().as_int();
+    const int noteStaffNum = node.child("staff").text().as_int();
+    const int staffN = ((noteStaffNum > 0) ? noteStaffNum : 1) + staffOffset;
+    AttNIntegerComparison comparison(STAFF, staffN);
+    Staff *staff = vrv_cast<Staff *>(measure->FindDescendantByComparison(&comparison, 1));
+    const pugi::xpath_node notations = node.select_node("notations[not(@print-object='no')]");
+
+    if (staff && notations) {
+        const std::string staffStr = std::to_string(staffN);
+        // the multiRest stands for the note: a fermata is anchored to it, centred over the block
+        MultiRest *multiRest = vrv_cast<MultiRest *>(staff->FindDescendantByType(MULTIREST));
+        pugi::xml_node xmlFermata = notations.node().child("fermata");
+        if (xmlFermata && multiRest) {
+            Fermata *fermata = new Fermata();
+            m_controlElements.push_back({ m_measureCounts.at(measure), fermata });
+            fermata->SetStartid("#" + multiRest->GetID());
+            fermata->SetStaff(staff->AttNInteger::StrToXsdPositiveIntegerList(staffStr));
+            if (xmlFermata.attribute("id")) fermata->SetID(xmlFermata.attribute("id").as_string());
+            this->ShapeFermata(fermata, xmlFermata);
+        }
+        // breath marks and caesuras are put at the end of the note, as for any note
+        const double tstamp = (double)(m_durTotal + duration) * (double)m_meterUnit / (double)(4 * m_ppq) + 0.9;
+        pugi::xpath_node xmlBreath = notations.node().select_node("articulations/breath-mark");
+        if (xmlBreath) {
+            Breath *breath = new Breath();
+            m_controlElements.push_back({ m_measureCounts.at(measure), breath });
+            breath->SetStaff(staff->AttNInteger::StrToXsdPositiveIntegerList(staffStr));
+            breath->SetPlace(
+                breath->AttPlacementRelStaff::StrToStaffrel(xmlBreath.node().attribute("placement").as_string()));
+            breath->SetColor(xmlBreath.node().attribute("color").as_string());
+            breath->SetTstamp(tstamp);
+        }
+        pugi::xpath_node xmlCaesura = notations.node().select_node("articulations/caesura");
+        if (xmlCaesura) {
+            Caesura *caesura = new Caesura();
+            m_controlElements.push_back({ m_measureCounts.at(measure), caesura });
+            caesura->SetStaff(staff->AttNInteger::StrToXsdPositiveIntegerList(staffStr));
+            caesura->SetPlace(
+                caesura->AttPlacementRelStaff::StrToStaffrel(xmlCaesura.node().attribute("placement").as_string()));
+            caesura->SetColor(xmlCaesura.node().attribute("color").as_string());
+            caesura->SetTstamp(tstamp);
+        }
+    }
+
+    if (!node.child("chord")) m_durTotal += duration;
+}
+
+void MusicXmlInput::ReadMusicXmlMultiRestMeasure(
+    pugi::xml_node node, Measure *measure, const short int staffOffset, bool isLast)
+{
+    assert(node);
+    assert(measure);
+
+    // Each measure is read at its own time: the end of any of them is the end of the multiRest
+    m_durTotal = 0;
+    const std::string measureNum = node.attribute("number").as_string();
+
+    bool isReported = false;
+    for (pugi::xml_node child : node) {
+        if (IsElement(child, "note")) {
+            this->ReadMusicXmlMultiRestNote(child, measure, staffOffset);
+        }
+        else if (IsElement(child, "backup")) {
+            this->ReadMusicXmlBackup(child, measure, measureNum);
+        }
+        else if (IsElement(child, "forward")) {
+            this->ReadMusicXmlForward(child, measure, measureNum);
+        }
+        else if (IsElement(child, "barline") && isLast) {
+            continue;
+        }
+        else if (!IsElement(child, "print") && !isReported) {
+            LogWarning("MusicXML import: <%s> in measure %s, inside a multi measure rest, is not read", child.name(),
+                measureNum.c_str());
+            isReported = true;
+        }
+    }
+
+    // The barline is the one of the last measure, read once the time of that measure is known
+    if (isLast) {
+        for (pugi::xml_node child : node.children("barline")) {
+            this->ReadMusicXmlBarLine(child, measure);
+        }
+    }
 }
 
 void MusicXmlInput::ReadMusicXmlNote(
